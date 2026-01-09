@@ -1,0 +1,16 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore environment folders
+env/
+venv/
+.venv/
+
+# Ignore data/videos
+*.mp4
+*.png
+*.dcm
+
+# Ignore VS Code settings
+.vscode/
