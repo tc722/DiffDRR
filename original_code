@@ -1,0 +1,379 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
+
+import os
+from tqdm import tqdm
+
+from diffdrr.data import load_example_ct
+from diffdrr.drr import DRR
+from diffdrr.metrics import NormalizedCrossCorrelation2d
+from diffdrr.pose import convert
+from diffdrr.registration import Registration
+from diffdrr.visualization import plot_drr
+from diffdrr.metrics import MutualInformation
+
+# Make the ground truth X-ray
+SDD = 1020.0
+HEIGHT = 100
+DELX = 4.0
+
+subject = load_example_ct()
+true_params = {
+    "sdr": SDD,
+    "alpha": 0.0,
+    "beta": 0.0,
+    "gamma": 0.0,
+    "bx": 0.0,
+    "by": 850.0,
+    "bz": 0.0,
+}
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+drr = DRR(subject, sdd=SDD, height=HEIGHT, delx=DELX).to(device)
+rotations = torch.tensor(
+    [[true_params["alpha"], true_params["beta"], true_params["gamma"]]]
+)
+translations = torch.tensor([[true_params["bx"], true_params["by"], true_params["bz"]]])
+gt_pose = convert(
+    rotations, translations, parameterization="euler_angles", convention="ZXY"
+).to(device)
+ground_truth = drr(gt_pose)
+
+plot_drr(ground_truth)
+plt.savefig("ground_truth_drr.png")
+
+# Make a random DRR
+np.random.seed(1)
+
+def pose_from_carm(sid, tx, ty, alpha, beta, gamma):
+    rot = torch.tensor([[alpha, beta, gamma]])
+    xyz = torch.tensor([[tx, sid, ty]])
+    return convert(rot, xyz, parameterization="euler_angles", convention="ZXY")
+
+def get_initial_parameters(true_params):
+    alpha = true_params["alpha"] + np.random.uniform(-np.pi / 8, np.pi / 8)
+    beta = true_params["beta"] + np.random.uniform(-np.pi / 8, np.pi / 8)
+    gamma = true_params["gamma"] + np.random.uniform(-np.pi / 8, np.pi / 8)
+    bx = true_params["bx"] + np.random.uniform(-10.0, 10.0)
+    by = true_params["by"] + np.random.uniform(-10.0, 10.0)
+    bz = true_params["bz"] + np.random.uniform(-10.0, 10.0)
+    pose = pose_from_carm(by, bx, bz, alpha, beta, gamma).cuda()
+    rotations, translations = pose.convert("euler_angles", "ZXY")
+    return rotations, translations, pose
+
+
+rotations, translations, pose = get_initial_parameters(true_params)
+drr = DRR(subject, sdd=SDD, height=HEIGHT, delx=DELX).to(device)
+with torch.no_grad():
+    est = drr(pose)
+plot_drr(est)
+plt.savefig("random_drr.png")
+
+# Initialize MI with calculated sigma
+mi = MutualInformation(
+    sigma=0.02, 
+    num_bins=64, 
+    epsilon=1e-10, 
+    normalize=True
+).to(device)
+
+# # Overwrite bins to match the image exact range
+# new_bins = torch.linspace(-0.1, 1.1, 256).to(device)
+# mi.register_buffer("bins", new_bins)
+
+
+criterion = mi
+print("Initial MI:",criterion(ground_truth/ground_truth.max(), est/est.max()).item())
+maxmi = criterion(ground_truth/ground_truth.max(), ground_truth/ground_truth.max()).item()
+print("Max MI:",maxmi)
+ 
+def optimize(
+    reg: Registration,
+    ground_truth,
+    lr_rotations=1e-3,
+    lr_translations=1e1,
+    momentum=0,
+    dampening=0,
+    n_itrs=500,
+    optimizer="sgd",  # 'sgd' or `adam`
+):
+    # Initialize an optimizer with different learning rates
+    # for rotations and translations since they have different scales
+    if optimizer == "sgd":
+        optim = torch.optim.SGD(
+            [
+                {"params": [reg._rotation], "lr": lr_rotations},
+                {"params": [reg._translation], "lr": lr_translations},
+            ],
+            momentum=momentum,
+            dampening=dampening,
+            maximize=True,
+        )
+        optimizer = optimizer.upper()
+    elif optimizer == "adam":
+        optim = torch.optim.Adam(
+            [
+                {"params": [reg._rotation], "lr": lr_rotations},
+                {"params": [reg._translation], "lr": lr_translations},
+            ],
+            maximize=True,
+        )
+        optimizer = optimizer.title()
+    else:
+        raise ValueError(f"Unrecognized optimizer {optimizer}")
+
+    params = []
+    losses = [criterion(ground_truth/ground_truth.max(), reg()/reg().max()).item()]
+    for itr in (pbar := tqdm(range(n_itrs), ncols=100)):
+        # Save the current set of parameters
+        alpha, beta, gamma = reg.rotation.squeeze().tolist()
+        bx, by, bz = reg.translation.squeeze().tolist()
+        params.append([i for i in [alpha, beta, gamma, bx, by, bz]])
+
+        # Run the optimization loop
+        optim.zero_grad()
+        estimate = reg()
+        loss = criterion(ground_truth/ground_truth.max(), estimate/estimate.max())
+        loss.backward()
+        optim.step()
+        losses.append(loss.item())
+        pbar.set_description(f"MI = {loss.item():06f}")
+
+        # Stop the optimization if the estimated and ground truth images are 99.9% correlated
+        if loss > 0.999 * maxmi:
+            if momentum != 0:
+                optimizer += " + momentum"
+            if dampening != 0:
+                optimizer += " + dampening"
+            tqdm.write(f"{optimizer} converged in {itr + 1} iterations")
+            break
+
+    # Save the final estimated pose
+    alpha, beta, gamma = reg.rotation.squeeze().tolist()
+    bx, by, bz = reg.translation.squeeze().tolist()
+    params.append([i for i in [alpha, beta, gamma, bx, by, bz]])
+
+    df = pd.DataFrame(params, columns=["alpha", "beta", "gamma", "bx", "by", "bz"])
+    df["loss"] = losses
+    return df
+
+def optimize_lbfgs(
+    reg: Registration,
+    ground_truth,
+    lr,
+    line_search_fn=None,
+    n_itrs=500,
+):
+    # Initialize the optimizer and define the closure function
+    optim = torch.optim.LBFGS(reg.parameters(), lr, line_search_fn=line_search_fn)
+
+    def closure():
+        if torch.is_grad_enabled():
+            optim.zero_grad()
+        estimate = reg()
+        loss = -criterion(ground_truth/ground_truth.max(), estimate/estimate.max())
+        if loss.requires_grad:
+            loss.backward()
+        return loss
+
+    params = []
+    losses = [closure().abs().item()]
+    for itr in (pbar := tqdm(range(n_itrs), ncols=100)):
+        # Save the current set of parameters
+        alpha, beta, gamma = reg.rotation.squeeze().tolist()
+        bx, by, bz = reg.translation.squeeze().tolist()
+        params.append([i for i in [alpha, beta, gamma, bx, by, bz]])
+
+        # Run the optimization loop
+        optim.step(closure)
+        with torch.no_grad():
+            loss = closure().abs().item()
+            losses.append(loss)
+            pbar.set_description(f"NCC = {loss:06f}")
+
+        # Stop the optimization if the estimated and ground truth images are 99.9% correlated
+        if loss > 0.999 * maxmi:
+            if line_search_fn is not None:
+                method = f"L-BFGS + strong Wolfe conditions"
+            else:
+                method = "L-BFGS"
+            tqdm.write(f"{method} converged in {itr + 1} iterations")
+            break
+
+    # Save the final estimated pose
+    alpha, beta, gamma = reg.rotation.squeeze().tolist()
+    bx, by, bz = reg.translation.squeeze().tolist()
+    params.append([i for i in [alpha, beta, gamma, bx, by, bz]])
+
+    df = pd.DataFrame(params, columns=["alpha", "beta", "gamma", "bx", "by", "bz"])
+    df["loss"] = losses
+    return df
+
+# Keyword arguments for diffdrr.drr.DRR
+kwargs = {
+    "subject": subject,
+    "sdd": SDD,
+    "height": HEIGHT,
+    "delx": DELX,
+    "stop_gradients_through_grid_sample": True,  # Enables faster optimization
+}
+
+# # Base SGD
+# drr = DRR(**kwargs).to(device)
+# reg = Registration(
+#     drr,
+#     rotations.clone(),
+#     translations.clone(),
+#     parameterization="euler_angles",
+#     convention="ZXY",
+# )
+# params_base = optimize(reg, ground_truth)
+# del drr
+
+# # SGD + momentum
+# drr = DRR(**kwargs).to(device)
+# reg = Registration(
+#     drr,
+#     rotations.clone(),
+#     translations.clone(),
+#     parameterization="euler_angles",
+#     convention="ZXY",
+# )
+# params_momentum = optimize(reg, ground_truth, momentum=5e-1)
+# del drr
+
+# # SGD + momentum + dampening
+# drr = DRR(**kwargs).to(device)
+# reg = Registration(
+#     drr,
+#     rotations.clone(),
+#     translations.clone(),
+#     parameterization="euler_angles",
+#     convention="ZXY",
+# )
+# params_momentum_dampen = optimize(reg, ground_truth, momentum=5e-1, dampening=1e-4)
+# del drr
+
+# Adam
+drr = DRR(**kwargs).to(device)
+reg = Registration(
+    drr,
+    rotations.clone(),
+    translations.clone(),
+    parameterization="euler_angles",
+    convention="ZXY",
+)
+params_adam = optimize(reg, ground_truth, 1e-1, 8e0, optimizer="adam")
+del drr
+
+# # L-BFGS
+# drr = DRR(**kwargs).to(device)
+# reg = Registration(
+#     drr,
+#     rotations.clone(),
+#     translations.clone(),
+#     parameterization="euler_angles",
+#     convention="ZXY",
+# )
+# params_lbfgs = optimize_lbfgs(reg, ground_truth, lr=1e0)
+# del drr
+
+# L-BFGS + line search
+drr = DRR(**kwargs).to(device)
+reg = Registration(
+    drr,
+    rotations.clone(),
+    translations.clone(),
+    parameterization="euler_angles",
+    convention="ZXY",
+)
+params_lbfgs_wolfe = optimize_lbfgs(
+    reg, ground_truth, lr=2e1, line_search_fn="strong_wolfe"
+)
+del drr
+
+parameters = {
+    # "SGD": (params_base, "#66c2a5"),
+    # "SGD + momentum": (params_momentum, "#fc8d62"),
+    # "SGD + momentum + dampening": (params_momentum_dampen, "#8da0cb"),
+    "Adam": (params_adam, "#e78ac3"),
+    # "L-BFGS": (params_lbfgs, "#a6d854"),
+    "L-BFGS + strong Wolfe conditions": (params_lbfgs_wolfe, "#ffd92f"),
+}
+
+with sns.axes_style("darkgrid"):
+    plt.figure(figsize=(5, 3), dpi=200)
+    for name, (df, color) in parameters.items():
+        plt.plot(df["loss"], label=name, color=color)
+    plt.xlabel("# Iterations")
+    plt.ylabel("NCC")
+    plt.legend()
+    plt.savefig("optimization_comparison.png")
+
+    
+from diffdrr.visualization import animate
+
+MAX_LENGTH = max(
+    map(
+        len,
+        [
+            # params_base,
+            # params_momentum,
+            # params_momentum_dampen,
+            params_adam,
+            # params_lbfgs,
+            params_lbfgs_wolfe,
+        ],
+    )
+)
+drr = DRR(subject, sdd=SDD, height=HEIGHT, delx=DELX).to(device)
+
+def get_unique_filename(base_name, ext, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
+    counter = 1
+    
+    while True:
+        # Format as 3 digits: 001, 002, etc.
+        filename = f"{output_dir}/{base_name}_{counter:03d}.{ext}"
+        
+        # If file doesn't exist, we found our unique name!
+        if not os.path.exists(filename):
+            return filename
+        
+        counter += 1
+
+
+def animate_in_browser(df, skip=1, max_length=None, duration=30):
+    if max_length is not None:
+        n = max_length - len(df)
+        df = pd.concat([df, df.iloc[[-1] * n]]).iloc[::skip]
+    else:
+        pass
+
+    out = animate(
+        "<bytes>",
+        df,
+        drr,
+        ground_truth=ground_truth,
+        verbose=True,
+        device=device,
+        extension=".webp",
+        duration=duration,
+        parameterization="euler_angles",
+        convention="ZXY",
+    )
+    # display(HTML(f"""<img src='{"data:img/gif;base64," + b64encode(out).decode()}'>"""))
+
+    export_filename = get_unique_filename("optimization_animation", "webp")
+    with open(export_filename,'wb') as f:
+        f.write(out)
+
+# animate_in_browser(params_base)
+# animate_in_browser(params_momentum)
+# animate_in_browser(params_momentum_dampen)
+animate_in_browser(params_adam)
+# animate_in_browser(params_lbfgs)
+animate_in_browser(params_lbfgs_wolfe)
