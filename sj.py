@@ -3,6 +3,7 @@ import pydicom
 import torchio as tio
 import matplotlib.pyplot as plt
 from pathlib import Path
+import torch.nn.functional as F
 
 # DiffDRR imports
 from diffdrr.drr import DRR
@@ -53,6 +54,10 @@ def normalize_tensor(tensor):
     if val_max - val_min != 0:
         return (tensor - val_min) / (val_max - val_min)
     return torch.zeros_like(tensor)
+
+def downsample(tensor, size=(256, 256)):
+    """Downsample image to save memory during MI calculation."""
+    return F.interpolate(tensor, size=size, mode='bilinear', align_corners=False)
 
 # Select computation device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -114,31 +119,29 @@ drr_projector = DRR(
     patch_size=250
 ).to(device)
 
-# Define Ground Truth Pose Parameters
-true_pose_params = {
-    "alpha": 0.0, "beta": 0.0, "gamma": 0.0,  # Rotations
-    "bx": 0.0,    "by": 850.0, "bz": 0.0      # Translations
+# Define Test Pose Parameters (Arbitrary configuration for testing)
+test_pose_params = {
+    "alpha": 0.0, "beta": 0.0, "gamma": 0.0,  # Rotations (Euler angles)
+    "bx": 0.0,    "by": 850.0, "bz": 0.0      # Translations (mm)
 }
 
 # Convert parameters to tensors expected by DiffDRR
-rotations = torch.tensor([[
-    true_pose_params["alpha"], true_pose_params["beta"], true_pose_params["gamma"]
+test_rotations = torch.tensor([[
+    test_pose_params["alpha"], test_pose_params["beta"], test_pose_params["gamma"]
 ]])
-translations = torch.tensor([[
-    true_pose_params["bx"], true_pose_params["by"], true_pose_params["bz"]
+test_translations = torch.tensor([[
+    test_pose_params["bx"], test_pose_params["by"], test_pose_params["bz"]
 ]])
 
-gt_pose = convert(
-    rotations, translations, 
+# Create the Pose object (The spatial orientation for the simulation)
+test_pose = convert(
+    test_rotations, test_translations, 
     parameterization="euler_angles", 
     convention="ZXY"
 ).to(device)
 
-# Generate Prediction
-pred_drr_raw = drr_projector(gt_pose)
-
-# Normalize prediction to [0, 1] for MI calculation
-pred_drr = normalize_tensor(pred_drr_raw)
+# Generate Prediction and Apply Normalization
+pred_drr = 1.0 - normalize_tensor(drr_projector(test_pose))
 
 # Visualization
 plot_drr(pred_drr)
@@ -149,6 +152,11 @@ plt.close()
 # 5. Final Metric Calculation
 # -----------------------------------------------------------------------------
 
-# Compare Target (X-ray) vs Prediction (projected MRI)
-final_score = mi_metric(target_xray, pred_drr)
-print(f"Final MI Score (Target vs Prediction): {final_score.item():.5f}")
+# Resize both images to 256x256 before calculating MI
+# This reduces the memory requirement from 1GB to ~60MB
+target_small = downsample(target_xray)
+pred_small = downsample(pred_drr)
+
+initial_score = mi_metric(target_small, pred_small)
+
+print(f"Initial MI Score (Target vs Prediction): {initial_score.item():.5f}")
