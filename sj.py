@@ -1,84 +1,154 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import seaborn as sns
 import torch
-from tqdm import tqdm
 import pydicom
 import torchio as tio
-from diffdrr.data import load_example_ct
-from diffdrr.drr import DRR
-from diffdrr.metrics import NormalizedCrossCorrelation2d
-from diffdrr.metrics import MutualInformation
-from diffdrr.pose import convert
-from diffdrr.registration import Registration
-from diffdrr.visualization import plot_drr
-from diffdrr.data import read
+import matplotlib.pyplot as plt
 from pathlib import Path
 
-def read_single_dcm(dcm_path):
-    dcm_ScalerImage = tio.ScalarImage(dcm_path)
-    dcm_tensor = dcm_ScalerImage.data.permute(3,0,2,1)
-    return dcm_tensor
+# DiffDRR imports
+from diffdrr.drr import DRR
+from diffdrr.data import read
+from diffdrr.pose import convert
+from diffdrr.visualization import plot_drr
+from diffdrr.metrics import MutualInformation
 
+# -----------------------------------------------------------------------------
+# 1. Setup and Helper Functions
+# -----------------------------------------------------------------------------
+
+def load_and_normalize_dicom(dcm_path):
+    """
+    Reads a DICOM file using TorchIO, corrects dimensions, and normalizes to [0, 1].
+    
+    Args:
+        dcm_path (Path): Path to the .dcm file.
+        
+    Returns:
+        torch.Tensor: A tensor of shape (B, C, H, W) with values in [0, 1].
+    """
+    # Load image using TorchIO to handle I/O
+    tio_image = tio.ScalarImage(dcm_path)
+    
+    # Permute dimensions to match DiffDRR expectation: (Batch, Channel, Height, Width)
+    # .contiguous() is required for view/reshape operations in metrics later
+    tensor = tio_image.data.permute(3, 0, 2, 1).contiguous()
+    
+    # --- Min-Max Normalization ---
+    # Essential for Mutual Information, which expects inputs in the [0, 1] range.
+    val_min = tensor.min()
+    val_max = tensor.max()
+    
+    if val_max - val_min != 0:
+        tensor = (tensor - val_min) / (val_max - val_min)
+    else:
+        tensor = torch.zeros_like(tensor)
+        
+    return tensor
+
+def normalize_tensor(tensor):
+    """
+    Helper to normalize any tensor (e.g., generated DRR) to [0, 1].
+    """
+    val_min = tensor.min()
+    val_max = tensor.max()
+    if val_max - val_min != 0:
+        return (tensor - val_min) / (val_max - val_min)
+    return torch.zeros_like(tensor)
+
+# Select computation device
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Running on device: {device}")
 
+# -----------------------------------------------------------------------------
+# 2. Initialization & Constants
+# -----------------------------------------------------------------------------
 
-# Make the ground truth X-ray
-SDD = 1020.0
-HEIGHT = 100
-DELX = 4.0
+# Paths
+patient_dir = Path.cwd() / "SJ"
+xray_path = patient_dir / "AP.dcm"
+mri_dir = patient_dir / "MRI"
 
-patient_folder = Path.cwd() / "SJ"
-
-# import and read the AP dicom header
-ap_xray_path = patient_folder / "AP.dcm"
-ds = pydicom.dcmread(ap_xray_path)
-
-ap_xray_column = ds.Columns
-ap_xray_SDD = ds.DistanceSourceToDetector
-ap_xray_pixel_size = ds.ImagerPixelSpacing[0]
-
-total_size = ap_xray_column * ap_xray_pixel_size
-
-raw_ap = read_single_dcm(ap_xray_path).to(device)
-plot_drr(raw_ap)
-plt.savefig(patient_folder /"raw_AP_DRR.png")
-
-mri_volume_path = patient_folder / "MRI"
-
-subject = read(mri_volume_path,
-               orientation="AP")
-
-true_params = {
-    "sdr": ap_xray_SDD,
-    "alpha": 0.0,
-    "beta": 0.0,
-    "gamma": 0.0,
-    "bx": 0.0,
-    "by": 850.0,
-    "bz": 0.0,
-}
-
-drr = DRR(subject, sdd=ap_xray_SDD, height=ap_xray_column, delx=ap_xray_pixel_size, patch_size=250).to(device)
-rotations = torch.tensor(
-    [[true_params["alpha"], true_params["beta"], true_params["gamma"]]]
-)
-translations = torch.tensor([[true_params["bx"], true_params["by"], true_params["bz"]]])
-gt_pose = convert(
-    rotations, translations, parameterization="euler_angles", convention="ZXY"
-).to(device)
-est = drr(gt_pose)
-
-plot_drr(est)
-plt.savefig(patient_folder /"MRI_DRR.png")
-
-# Initialize MI with calculated sigma
-mi = MutualInformation(
-    sigma=0.2, 
+# Metric Initialization
+# sigma=0.005 provides a sharp landscape for fine-tuning alignment.
+# Ensure num_bins matches the bit-depth resolution you need (256 is standard).
+mi_metric = MutualInformation(
+    sigma=0.005, 
     num_bins=256, 
     epsilon=1e-10, 
     normalize=True
 ).to(device)
 
-print("Initial MI=",mi(raw_ap,est))
+# -----------------------------------------------------------------------------
+# 3. Load Ground Truth (Target X-Ray)
+# -----------------------------------------------------------------------------
+
+# Read DICOM metadata to get geometry constraints
+dcm_meta = pydicom.dcmread(xray_path)
+img_height = dcm_meta.Columns            # In DICOM, Columns corresponds to width/grid size
+sdd = dcm_meta.DistanceSourceToDetector  # Source-to-Detector Distance
+pixel_spacing = dcm_meta.ImagerPixelSpacing[0]
+
+# Load the actual pixel data (Target)
+target_xray = load_and_normalize_dicom(xray_path).to(device)
+
+# Visualization
+plot_drr(target_xray)
+plt.savefig(patient_dir / "target_xray_drr.png")
+plt.close()
+
+# Sanity Check: Self-MI should be high (0.5 - 1.0)
+print(f"Self-MI Check (Target vs Target): {mi_metric(target_xray, target_xray).item():.5f}")
+
+# -----------------------------------------------------------------------------
+# 4. DRR Generation (Prediction from MRI)
+# -----------------------------------------------------------------------------
+
+# Load 3D Volume
+subject_mri = read(mri_dir, orientation="AP")
+
+# Initialize DRR Projector with X-Ray geometry
+drr_projector = DRR(
+    subject_mri, 
+    sdd=sdd, 
+    height=img_height, 
+    delx=pixel_spacing, 
+    patch_size=250
+).to(device)
+
+# Define Ground Truth Pose Parameters
+true_pose_params = {
+    "alpha": 0.0, "beta": 0.0, "gamma": 0.0,  # Rotations
+    "bx": 0.0,    "by": 850.0, "bz": 0.0      # Translations
+}
+
+# Convert parameters to tensors expected by DiffDRR
+rotations = torch.tensor([[
+    true_pose_params["alpha"], true_pose_params["beta"], true_pose_params["gamma"]
+]])
+translations = torch.tensor([[
+    true_pose_params["bx"], true_pose_params["by"], true_pose_params["bz"]
+]])
+
+gt_pose = convert(
+    rotations, translations, 
+    parameterization="euler_angles", 
+    convention="ZXY"
+).to(device)
+
+# Generate Prediction
+pred_drr_raw = drr_projector(gt_pose)
+
+# Normalize prediction to [0, 1] for MI calculation
+pred_drr = normalize_tensor(pred_drr_raw)
+
+# Visualization
+plot_drr(pred_drr)
+plt.savefig(patient_dir / "predicted_mri_drr.png")
+plt.close()
+
+# -----------------------------------------------------------------------------
+# 5. Final Metric Calculation
+# -----------------------------------------------------------------------------
+
+# Compare Target (X-ray) vs Prediction (projected MRI)
+final_score = mi_metric(target_xray, pred_drr)
+print(f"Final MI Score (Target vs Prediction): {final_score.item():.5f}")
